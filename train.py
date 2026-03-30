@@ -37,7 +37,7 @@ class GPTConfig:
     n_head: int = 6
     n_kv_head: int = 6
     n_embd: int = 768
-    window_pattern: str = "SSSL"
+    window_pattern: str = "L"
 
 
 def norm(x):
