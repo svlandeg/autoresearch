@@ -1,0 +1,15 @@
+commit	val_bpb	memory_gb	status	description
+86ea093	1.868756	6.0	keep	baseline: depth=8, dim=512, SSSL, batch=16, total_batch=2^19
+be43d33	1.922010	24.7	discard	depth=16 dim=1024 batch=32 - worse, fewer steps
+c36bea7	1.867355	22.3	discard	depth=8 batch=64 (4 grad accum) - barely better
+2956da3	1.854402	22.3	keep	total_batch=2^18, batch=64, 48 steps
+633b439	1.661824	22.1	keep	total_batch=2^17, batch=64, 83 steps
+f5a77c7	1.560106	11.3	keep	total_batch=2^16, batch=32, 150 steps
+3ae5f0f	1.402930	5.9	keep	total_batch=2^15, batch=16, 267 steps
+df0e8f9	1.398889	3.1	keep	total_batch=2^14, batch=8, 429 steps - marginal gain
+0bf1ab0	1.383687	3.1	keep	matrix_lr=0.06, warmdown=0.3 - better LR
+db6cc37	1.379903	3.1	keep	warmdown=0.5, matrix_lr=0.06 - sweet spot
+c7225e4	1.370697	3.0	keep	MLP ratio 3x (more steps=459)
+0f140bb	1.362235	2.9	keep	MLP ratio 2x (more steps=487)
+d0173c3	1.356529	2.7	keep	MLP ratio 1x (more steps=536)
+c2d28be	0.000000	0.0	crash	no MLP - param grad None crash
