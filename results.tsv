@@ -1,0 +1,19 @@
+commit	val_bpb	memory_gb	status	description
+86ea093	1.868415	6.0	keep	baseline
+2d3382e	1.674302	6.0	keep	reduce TOTAL_BATCH_SIZE to 2^17 (more optimizer steps)
+c5730b9	1.591652	6.0	keep	reduce TOTAL_BATCH_SIZE to 2^16
+db86a85	1.403950	5.9	keep	reduce TOTAL_BATCH_SIZE to 2^15
+5aec24d	0.000000	0.0	crash	reduce TOTAL_BATCH_SIZE to 2^14 (too small for device batch)
+06c8e53	1.399685	3.1	keep	DEVICE_BATCH_SIZE=8 TOTAL_BATCH_SIZE=2^14 grad_accum=1
+d9c5c18	1.691354	12.7	discard	depth=12 bigger model (fewer steps hurt more than capacity helps)
+09ce84b	1.387550	5.9	keep	warmdown_ratio=0.3 (more time at high LR)
+ef22223	1.386007	5.9	keep	warmdown_ratio=0.2
+b7f483f	1.391933	5.9	discard	warmdown_ratio=0.1 (too little cooldown)
+0d595f6	1.378964	5.9	keep	MATRIX_LR=0.06
+2fa8dd8	1.391779	5.9	discard	MATRIX_LR=0.08 (too high)
+80cd231	1.387105	3.1	discard	BS=8 batch=2^14 with tuned settings (2^15 still better)
+297f84d	1.382377	5.9	discard	window pattern L (SSSL is better)
+bdbdcab	1.388647	5.9	discard	WEIGHT_DECAY=0.0 (weight decay helps even in short runs)
+ea1570a	1.514725	5.6	discard	disable VE (VE is critical for quality)
+e66ae69	1.393658	5.9	discard	ADAM_BETAS=(0.9, 0.95) - higher beta1 worse
+3db6453	1.327312	3.5	keep	depth=6 (384 dim, 26M params, 400 steps)
