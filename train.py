@@ -141,8 +141,9 @@ class GPT(nn.Module):
             str(i): nn.Embedding(config.vocab_size, kv_dim)
             for i in range(config.n_layer) if has_ve(i, config.n_layer)
         })
-        # Hashed bigram embedding: direct (prev_token, cur_token) pair statistics at the input
-        self.bigram_num_buckets = 131072
+        # Hashed bigram embedding: direct (prev_token, cur_token) pair statistics at the input.
+        # 2^19 buckets = 4x fewer hash collisions than 2^17 (2048 vs 8192 pairs per bucket).
+        self.bigram_num_buckets = 524288
         self.bigram_embed = nn.Embedding(self.bigram_num_buckets, config.n_embd)
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
