@@ -141,6 +141,9 @@ class GPT(nn.Module):
             str(i): nn.Embedding(config.vocab_size, kv_dim)
             for i in range(config.n_layer) if has_ve(i, config.n_layer)
         })
+        # Hashed bigram embedding: direct (prev_token, cur_token) pair statistics at the input
+        self.bigram_num_buckets = 131072
+        self.bigram_embed = nn.Embedding(self.bigram_num_buckets, config.n_embd)
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -173,6 +176,8 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+        # Bigram embedding starts at zero: step-0 dynamics identical to the no-bigram model
+        torch.nn.init.zeros_(self.bigram_embed.weight)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -181,6 +186,7 @@ class GPT(nn.Module):
         self.transformer.wte.to(dtype=torch.bfloat16)
         for ve in self.value_embeds.values():
             ve.to(dtype=torch.bfloat16)
+        self.bigram_embed.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -212,6 +218,7 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+                          self.bigram_embed.weight.numel() +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_lambda.numel())
         h = self.config.n_head
@@ -227,14 +234,16 @@ class GPT(nn.Module):
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+        bigram = sum(p.numel() for p in self.bigram_embed.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = (self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                    self.smear_lambda.numel())
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + bigram + lm_head + transformer_matrices + scalars
         return {
-            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
+            'wte': wte, 'value_embeds': value_embeds, 'bigram_embed': bigram,
+            'lm_head': lm_head, 'transformer_matrices': transformer_matrices,
+            'scalars': scalars, 'total': total,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
@@ -243,13 +252,14 @@ class GPT(nn.Module):
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
+        bigram_params = list(self.bigram_embed.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_lambda]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
-            len(x0_params) + len(smear_params))
+            len(lm_head_params) + len(value_embeds_params) + len(bigram_params) +
+            len(resid_params) + len(x0_params) + len(smear_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -257,6 +267,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=bigram_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=smear_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
@@ -281,6 +292,10 @@ class GPT(nn.Module):
         x = norm(x)
         # Smear: blend in the previous token's embedding (zero-padded at position 0)
         x = x + self.smear_lambda * torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        # Hashed bigram: add a learned vector keyed by the (previous, current) token pair
+        prev = torch.cat([torch.full_like(idx[:, :1], -1), idx[:, :-1]], dim=1)
+        bucket = (idx * 1000003 + prev) % self.bigram_num_buckets
+        x = x + self.bigram_embed(bucket)
         x0 = x
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
