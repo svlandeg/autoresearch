@@ -131,6 +131,8 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Smear gate: blends each token's embedding with the previous token's embedding
+        self.smear_gate = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
@@ -151,6 +153,8 @@ class GPT(nn.Module):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        # Smear gate starts at zero -> gate = 2*sigmoid(0) = 1.0 (full bigram blend at init)
+        torch.nn.init.zeros_(self.smear_gate.weight)
         # Transformer blocks
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
@@ -225,11 +229,13 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        smear = sum(p.numel() for p in self.smear_gate.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + smear + transformer_matrices + scalars
         return {
             'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
+            'smear_gate': smear,
             'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
         }
 
@@ -240,10 +246,12 @@ class GPT(nn.Module):
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+        smear_params = list(self.smear_gate.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) +
+            len(smear_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -260,6 +268,11 @@ class GPT(nn.Module):
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
             ))
+        # Smear gate is a 2D matrix -> Muon (its own group, square shape)
+        param_groups.append(dict(
+            kind='muon', params=smear_params, lr=matrix_lr,
+            momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+        ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
@@ -271,6 +284,11 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
         x = self.transformer.wte(idx)
+        # Smear gate: mix in the previous token's raw embedding (cheap bigram features).
+        # Zero row at position 0 so the first token is unaffected.
+        x_prev = F.pad(x[:, :-1], (0, 0, 1, 0))
+        gate = 2 * torch.sigmoid(self.smear_gate(x))
+        x = x + gate * x_prev
         x = norm(x)
         x0 = x
         for i, block in enumerate(self.transformer.h):
