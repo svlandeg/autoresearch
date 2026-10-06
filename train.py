@@ -38,6 +38,7 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    bigram_hash_size: int = 65536
 
 
 def norm(x):
@@ -133,6 +134,9 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # Smear gate: blends each token's embedding with the previous token's embedding
         self.smear_gate = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        # Bigram hash embedding: learned vector for each (prev_token, cur_token) pair,
+        # indexed via a multiplicative hash into a fixed bucket table
+        self.bigram_embed = nn.Embedding(config.bigram_hash_size, config.n_embd)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
@@ -155,6 +159,8 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         # Smear gate starts at zero -> gate = 2*sigmoid(0) = 1.0 (full bigram blend at init)
         torch.nn.init.zeros_(self.smear_gate.weight)
+        # Bigram hash embedding starts at zero -> neutral at init, learned purely from data
+        torch.nn.init.zeros_(self.bigram_embed.weight)
         # Transformer blocks
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
@@ -181,6 +187,7 @@ class GPT(nn.Module):
         self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
         self.transformer.wte.to(dtype=torch.bfloat16)
+        self.bigram_embed.to(dtype=torch.bfloat16)
         for ve in self.value_embeds.values():
             ve.to(dtype=torch.bfloat16)
 
@@ -214,6 +221,7 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+                          self.bigram_embed.weight.numel() +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
@@ -227,15 +235,16 @@ class GPT(nn.Module):
 
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
+        bigram = sum(p.numel() for p in self.bigram_embed.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         smear = sum(p.numel() for p in self.smear_gate.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + smear + transformer_matrices + scalars
+        total = wte + bigram + value_embeds + lm_head + smear + transformer_matrices + scalars
         return {
-            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
-            'smear_gate': smear,
+            'wte': wte, 'bigram_hash': bigram, 'value_embeds': value_embeds,
+            'lm_head': lm_head, 'smear_gate': smear,
             'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
         }
 
@@ -245,19 +254,20 @@ class GPT(nn.Module):
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
+        bigram_params = list(self.bigram_embed.parameters())
         lm_head_params = list(self.lm_head.parameters())
         smear_params = list(self.smear_gate.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) +
-            len(smear_params))
+            len(bigram_params) + len(lm_head_params) + len(value_embeds_params) +
+            len(resid_params) + len(x0_params) + len(smear_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=embedding_params + bigram_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
@@ -289,6 +299,11 @@ class GPT(nn.Module):
         x_prev = F.pad(x[:, :-1], (0, 0, 1, 0))
         gate = 2 * torch.sigmoid(self.smear_gate(x))
         x = x + gate * x_prev
+        # Bigram hash: add a learned vector indexed by the (previous, current) token pair.
+        # Position 0 uses token id 0 as its "previous" token (a learned BOS-ish bucket).
+        prev_idx = F.pad(idx[:, :-1], (1, 0))
+        bigram_hash = (prev_idx.long() * 1000003 + idx.long()) % self.config.bigram_hash_size
+        x = x + self.bigram_embed(bigram_hash)
         x = norm(x)
         x0 = x
         for i, block in enumerate(self.transformer.h):
@@ -451,6 +466,7 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+BIGRAM_HASH_SIZE = 2**16 # buckets for the (prev, cur) bigram hash embedding
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
@@ -491,7 +507,7 @@ def build_model_config(depth):
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
+        window_pattern=WINDOW_PATTERN, bigram_hash_size=BIGRAM_HASH_SIZE,
     )
 
 config = build_model_config(DEPTH)
