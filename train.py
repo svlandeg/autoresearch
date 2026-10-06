@@ -466,7 +466,7 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
-BIGRAM_HASH_SIZE = 2**16 # buckets for the (prev, cur) bigram hash embedding
+BIGRAM_HASH_SIZE = 2**18 # buckets for the (prev, cur) bigram hash embedding (4x fewer collisions)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
