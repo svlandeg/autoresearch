@@ -1,0 +1,11 @@
+{
+  "goal": "Beat the measured val_bpb baseline on autoresearch.",
+  "command": "uv run train.py",
+  "metric": "val_bpb",
+  "baseline": 1.253713,
+  "budget_gpu_hours": 2.0,
+  "max_experiments": 6,
+  "max_concurrency": 1,
+  "walltime": 10,
+  "stop_conditions": ["Stop after 6 experiments or 2 GPU-hours, whichever comes first."]
+}
